@@ -17,10 +17,16 @@ def one_hot(label_strings, n_classes, class_map):
 	return y
 
 def get_data(data_folder, train_valid_split=.95):
-	all_img_paths = glob(os.path.join(data_folder, '*', '*.jpg'))
-	random.shuffle(all_img_paths)
-	train_img_paths = all_img_paths[:int(train_valid_split*len(all_img_paths))]
-	valid_img_paths = all_img_paths[int(train_valid_split*len(all_img_paths)):]
+	all_img_folders = glob(os.path.join(data_folder, '*'))
+	train_img_paths = []
+	valid_img_paths = []
+	for folder in all_img_folders:
+		this_bird_images = glob(os.path.join(folder, '*.jpg'))
+		split_index = int(train_valid_split*len(this_bird_images))
+		# print split_index, len(this_bird_images), folder
+		train_img_paths.extend(this_bird_images[:split_index])
+		valid_img_paths.extend(this_bird_images[split_index:])
+
 	X_train, y_train, X_valid, y_valid = [], [], [], []
 	for img_file in train_img_paths:
 		if '.' not in img_file.split('/')[-2].split('_')[-1]:
@@ -36,11 +42,11 @@ def get_data(data_folder, train_valid_split=.95):
 	n_classes = len(y_set)
 	print n_classes, 'n_classes'
 	class_map = dict(zip(y_set, range(n_classes)))
-	return train_img_paths, valid_img_paths, np.array(X_train, dtype=np.float32), one_hot(y_train, n_classes, class_map), np.array(X_valid, dtype=np.float32), one_hot(y_valid, n_classes, class_map)
+	reverse_class_map = dict(zip(range(n_classes), y_set))
+	return train_img_paths, valid_img_paths, np.array(X_train, dtype=np.float32), one_hot(y_train, n_classes, class_map), np.array(X_valid, dtype=np.float32), one_hot(y_valid, n_classes, class_map), reverse_class_map
 
-# TODO: Add data augmentation
-def get_augmented_data(X, y, augment_prob=0.35):
-	n_samples = int(augment_prob*X.shape[0])
+def get_augmented_data(X, y, augment_prob=0.4):
+	n_samples = int(augment_prob*X.shape[0]) # sample augment_prob UNIQUE images
 	augmented_X, augmented_y = np.zeros((X.shape)), np.zeros((y.shape))
 	augmented_X, augmented_y = augmented_X[:n_samples,:,:,:], augmented_y[:n_samples,:]
 	indices = random.sample(range(X.shape[0]), n_samples)
@@ -114,8 +120,6 @@ def build_model(X, data_dict, keep_prob): # X should be bgr order
 	conv5_1 = conv2d(pool4, name='conv5_1')
 	conv5_2 = conv2d(conv5_1, name='conv5_2')
 	conv5_3 = conv2d(conv5_2, name='conv5_3')
-	# pool5 = maxpool2d(conv5_3, name='pool5', k=2) # removed according to the paper 
-	# print pool5.name, 'pool5 name' # pool5/pool5:0
 
 	gap = global_average_pooling(conv5_3)
 	Wout = xavier_init((512, n_classes), name='wout')
@@ -124,27 +128,58 @@ def build_model(X, data_dict, keep_prob): # X should be bgr order
 	fc1 = tf.nn.dropout(fc1, keep_prob=keep_prob)
 	return fc1
 
-# ======================= HYPERPARAMETERS =======================
-data_dict = np.load('vgg16.npy', encoding='latin1').item()
-# print data_dict.keys()
-# print data_dict['conv5_3'][0].shape, data_dict['conv5_3'][1].shape, 'conv5_3'
+def draw_CAM(idx, this_sample, sess, n_classes=1, folder='./results/'):
+	last_conv = tf.get_default_graph().get_tensor_by_name('conv5_3/conv5_3:0')
+	last_weights = tf.get_default_graph().get_tensor_by_name('wout/wout:0')
+	last_biases = tf.get_default_graph().get_tensor_by_name('bout:0')
+	last_conv_reshaped = tf.reshape(last_conv, [-1, 512])
 
-train_img_paths, valid_img_paths, X_train, y_train, X_valid, y_valid = get_data(os.path.join('.', 'images'))
-augmented_Xtrain, augmented_ytrain = get_augmented_data(X_train, y_train)
-# print X_train.shape, y_train.shape, augmented_Xtrain.shape, augmented_ytrain.shape
+	preds, feat_map, Wk_c, b_c = sess.run([outputs, last_conv_reshaped, last_weights, last_biases], feed_dict={X:this_sample, keep_prob:1.})
+	top_class = np.argmax(preds, axis=1)
+
+	class_map = tf.nn.bias_add(tf.matmul(feat_map, Wk_c[:,top_class]), b_c[top_class])
+	attention = sess.run([class_map], feed_dict={X:this_sample, keep_prob:1.})[0]
+	# print [n.name for n in tf.get_default_graph().as_graph_def().node]
+	# print attention.shape
+
+	cam = attention.reshape((14, 14))
+	cam = cam - np.min(cam)
+	cam_img = cam / np.max(cam)
+	cam_img = np.uint8(255 * cam_img)
+	original_img = cv2.imread(valid_img_paths[idx])
+	print valid_img_paths[idx], reverse_class_map[int(top_class)]
+	cv2.imwrite(folder+'original_{}_{}.jpg'.format(idx, valid_img_paths[idx].split('/')[-2]), original_img)
+	cam_img = cv2.resize(cam_img, (original_img.shape[0], original_img.shape[1]))
+	# cam_img = cam_img.T
+	heatmap = cv2.applyColorMap(cam_img, cv2.COLORMAP_JET)
+	result = heatmap * 0.3 + original_img * 0.5
+	cv2.imwrite(folder+'CAM_{}_{}.jpg'.format(idx, reverse_class_map[int(top_class)]), result)
+
+# ======================= HYPERPARAMETERS =======================
+print 'Loading VGG weights ...'
+data_dict = np.load('vgg16.npy', encoding='latin1').item()
+
+print 'Getting data ...'
+train_img_paths, valid_img_paths, X_train, y_train, X_valid, y_valid, reverse_class_map = get_data(os.path.join('.', 'images'))
+#X_train, y_train = shuffle(X_train, y_train)
+#X_valid, y_valid = shuffle(X_valid, y_valid)
+
+# print 'Augmenting data ...'
+# augmented_Xtrain, augmented_ytrain = get_augmented_data(X_train, y_train)
 # X_train = np.concatenate((X_train, augmented_Xtrain), axis=0)
 # y_train = np.concatenate((y_train, augmented_ytrain), axis=0)
-# print X_train.shape, y_train.shape, 'augmented'
-# #exit()
+
 # augmented_Xvalid, augmented_yvalid = get_augmented_data(X_valid, y_valid)
 # X_valid = np.concatenate((X_valid, augmented_Xvalid), axis=0)
 # y_valid = np.concatenate((y_valid, augmented_yvalid), axis=0)
 
+# print X_train.shape, y_train.shape, X_valid.shape, y_valid.shape, 'augmented'
+
 VGG_MEAN = [103.939, 116.779, 123.68]
 LEARNING_RATE = 0.001
-BATCH_SIZE = 32
-DEVICE = '/cpu:0'
+BATCH_SIZE = 64
 N_EPOCHS = 50
+KEEP_PROB = 1.0
 n_classes = y_train.shape[1]
 n_batches_train = y_train.shape[0]/BATCH_SIZE
 n_batches_valid = y_valid.shape[0]/BATCH_SIZE
@@ -168,7 +203,7 @@ with tf.Graph().as_default():
 
 	saver = tf.train.Saver()
 	init = tf.global_variables_initializer()
-	with tf.Session() as sess, tf.device(DEVICE):
+	with tf.Session() as sess:
 		sess.run(init)
 		# for epoch in range(N_EPOCHS):
 		# 	train_loss, valid_loss = [], []
@@ -176,7 +211,7 @@ with tf.Graph().as_default():
 		# 	for batch_id in range(n_batches_train):
 		# 		batch_X = X_train[BATCH_SIZE*batch_id:BATCH_SIZE*(batch_id+1)]
 		# 		batch_y = y_train[BATCH_SIZE*batch_id:BATCH_SIZE*(batch_id+1)]
-		# 		preds, loss, acc, _ = sess.run([outputs, cost, accuracy, optimizer], feed_dict={X:batch_X, y:batch_y, keep_prob:1.})
+		# 		preds, loss, acc, _ = sess.run([outputs, cost, accuracy, optimizer], feed_dict={X:batch_X, y:batch_y, keep_prob:KEEP_PROB})
 		# 		train_loss.append(loss)
 		# 		train_acc.append(acc)
 		# 		print 'Epoch {} Iteration {} Loss {} Accuracy {}'.format(epoch, batch_id, loss, acc)
@@ -191,39 +226,15 @@ with tf.Graph().as_default():
 		# 		print 'Epoch {} Iteration {} Validation Loss {} Validation Accuracy {}'.format(epoch, batch_id, loss, acc)
 
 		# 	print 'Avg Training Loss {} Accuracy {} Test Loss {} Accuracy {}'.format(np.mean(train_loss), np.mean(train_acc), np.mean(valid_loss), np.mean(valid_acc))
-		# 	saver.save(sess, './birds_epoch{}_validloss{}_validacc{}'.format(epoch, np.mean(valid_loss), np.mean(valid_acc)))
+		# 	saver.save(sess, './models/birds_epoch{}_validloss{}_validacc{}'.format(epoch, np.mean(valid_loss), np.mean(valid_acc)))
 
 # =================== Visualizing and CAM =====================================
-		saver.restore(sess, './birds_epoch38_validloss1.19091486931_validacc0.746527791023')
+		print 'Visualizing now...'
+		saver.restore(sess, './models/birds_epoch19_validloss1.04835760593_validacc0.744140625')
 		# samples = random.sample(range(X_train.shape[0]), 10) # take 10 random samples from the training_set
-		samples = range(10)
+		samples = range(100)
 		for idx in samples:
-			this_sample = X_train[idx].reshape((1,) + X_train[idx].shape)
-			# print this_sample.shape
+			this_sample = X_valid[idx].reshape((1,) + X_valid[idx].shape)
+			draw_CAM(idx, this_sample, sess)
 
-			# print [n.name for n in tf.get_default_graph().as_graph_def().node]
-			last_conv = tf.get_default_graph().get_tensor_by_name('conv5_3/conv5_3:0')
-			last_weights = tf.get_default_graph().get_tensor_by_name('wout/wout:0')
-			last_biases = tf.get_default_graph().get_tensor_by_name('bout:0')
-			last_conv_reshaped = tf.reshape(last_conv, [-1, 512])
-
-			print last_conv_reshaped.get_shape(), last_weights.get_shape(), last_biases.get_shape()
-			preds, feat_map, Wk_c, b_c = sess.run([outputs, last_conv_reshaped, last_weights, last_biases], feed_dict={X:this_sample, keep_prob:1.})
-			top_class = np.argmax(preds, axis=1)
-
-			class_map = tf.nn.bias_add(tf.matmul(feat_map, Wk_c[:,top_class]), b_c[top_class])
-			attention = sess.run([class_map], feed_dict={X:this_sample, keep_prob:1.})[0]
-			print attention.shape
-
-			cam = attention.reshape((14, 14))
-	        cam = cam - np.min(cam)
-	        cam_img = cam / np.max(cam)
-	        cam_img = np.uint8(255 * cam_img)
-	        cam_img = cv2.resize(cam_img, (224, 224))
-	        cam_img = cam_img.T
-	        original_img = train_img_paths[idx]
-	        original_img = cv2.imread(original_img)
-    		cv2.imwrite('original_{}.jpg'.format(idx), original_img)
-	        heatmap = cv2.applyColorMap(cam_img, cv2.COLORMAP_JET)
-    		result = heatmap * 0.3 + original_img * 0.5
-    		cv2.imwrite('CAM_{}.jpg'.format(idx), result)
+			
