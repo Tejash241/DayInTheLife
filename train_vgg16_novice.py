@@ -36,17 +36,27 @@ def get_data(data_folder, train_valid_split=.95):
 	n_classes = len(y_set)
 	print n_classes, 'n_classes'
 	class_map = dict(zip(y_set, range(n_classes)))
-	return np.array(X_train, dtype=np.float32), one_hot(y_train, n_classes, class_map), np.array(X_valid, dtype=np.float32), one_hot(y_valid, n_classes, class_map)
+	return train_img_paths, valid_img_paths, np.array(X_train, dtype=np.float32), one_hot(y_train, n_classes, class_map), np.array(X_valid, dtype=np.float32), one_hot(y_valid, n_classes, class_map)
 
-def get_augmented_data(X, y, crop_probab=0.5):
-	pass
+# TODO: Add data augmentation
+def get_augmented_data(X, y, augment_prob=0.35):
+	n_samples = int(augment_prob*X.shape[0])
+	augmented_X, augmented_y = np.zeros((X.shape)), np.zeros((y.shape))
+	augmented_X, augmented_y = augmented_X[:n_samples,:,:,:], augmented_y[:n_samples,:]
+	indices = random.sample(range(X.shape[0]), n_samples)
+	with tf.Session() as sess:
+		for idx, i in enumerate(indices):
+			augmented_X[idx] = tf.image.flip_left_right(X[i]).eval(session=sess)
+			augmented_y[idx] = y[i]
+
+	return np.array(augmented_X), np.array(augmented_y)
 
 # ======================== The Model =====================================
 def get_conv_filter_pretrained(data_dict, name):
-    return tf.constant(data_dict[name][0], name="filter")
+    return tf.Variable(data_dict[name][0], name=name+"/filter", trainable=False)
 
 def get_bias_pretrained(data_dict, name):
-    return tf.constant(data_dict[name][1], name="biases")
+    return tf.Variable(data_dict[name][1], name=name+"/bias", trainable=False)
 
 def xavier_init(shape, name):
 	if len(shape)==2:
@@ -65,11 +75,11 @@ def get_bias(shape, name):
 
 	return b
 
-def conv2d(img, name, strides=1):
+def conv2d(img, name, stride=1):
 	with tf.variable_scope(name):
 		w = get_conv_filter_pretrained(data_dict, name)
 		b = get_bias_pretrained(data_dict, name)
-		conv = tf.nn.relu(tf.nn.bias_add(tf.nn.conv2d(img, w, strides=[1,1,1,1], padding='SAME'), b), name=name)
+		conv = tf.nn.relu(tf.nn.bias_add(tf.nn.conv2d(img, w, strides=[1,stride,stride,1], padding='SAME'), b), name=name)
 
 	return conv
 
@@ -104,21 +114,32 @@ def build_model(X, data_dict, keep_prob): # X should be bgr order
 	conv5_1 = conv2d(pool4, name='conv5_1')
 	conv5_2 = conv2d(conv5_1, name='conv5_2')
 	conv5_3 = conv2d(conv5_2, name='conv5_3')
-	pool5 = maxpool2d(conv5_3, name='pool5', k=2)
+	# pool5 = maxpool2d(conv5_3, name='pool5', k=2) # removed according to the paper 
+	# print pool5.name, 'pool5 name' # pool5/pool5:0
 
-	gap = global_average_pooling(pool5)
+	gap = global_average_pooling(conv5_3)
 	Wout = xavier_init((512, n_classes), name='wout')
 	bout = tf.Variable(tf.zeros(n_classes), name='bout')
 	fc1 = tf.nn.bias_add(tf.matmul(gap, Wout), bout, name='fc1')
+	fc1 = tf.nn.dropout(fc1, keep_prob=keep_prob)
 	return fc1
-
 
 # ======================= HYPERPARAMETERS =======================
 data_dict = np.load('vgg16.npy', encoding='latin1').item()
 # print data_dict.keys()
 # print data_dict['conv5_3'][0].shape, data_dict['conv5_3'][1].shape, 'conv5_3'
 
-X_train, y_train, X_valid, y_valid = get_data(os.path.join('.', 'images'))
+train_img_paths, valid_img_paths, X_train, y_train, X_valid, y_valid = get_data(os.path.join('.', 'images'))
+augmented_Xtrain, augmented_ytrain = get_augmented_data(X_train, y_train)
+# print X_train.shape, y_train.shape, augmented_Xtrain.shape, augmented_ytrain.shape
+# X_train = np.concatenate((X_train, augmented_Xtrain), axis=0)
+# y_train = np.concatenate((y_train, augmented_ytrain), axis=0)
+# print X_train.shape, y_train.shape, 'augmented'
+# #exit()
+# augmented_Xvalid, augmented_yvalid = get_augmented_data(X_valid, y_valid)
+# X_valid = np.concatenate((X_valid, augmented_Xvalid), axis=0)
+# y_valid = np.concatenate((y_valid, augmented_yvalid), axis=0)
+
 VGG_MEAN = [103.939, 116.779, 123.68]
 LEARNING_RATE = 0.001
 BATCH_SIZE = 32
@@ -147,26 +168,62 @@ with tf.Graph().as_default():
 
 	saver = tf.train.Saver()
 	init = tf.global_variables_initializer()
-	train_loss, valid_loss = [], []
-	train_acc, train_acc = [], []
 	with tf.Session() as sess, tf.device(DEVICE):
 		sess.run(init)
-		for epoch in range(N_EPOCHS):
-			for batch_id in range(n_batches_train):
-				batch_X = X_train[BATCH_SIZE*batch_id:BATCH_SIZE*(batch_id+1)]
-				batch_y = y_train[BATCH_SIZE*batch_id:BATCH_SIZE*(batch_id+1)]
-				preds, loss, acc, _ = sess.run([outputs, cost, accuracy, optimizer], feed_dict={X:batch_X, y:batch_y, keep_prob:100.})
-				train_loss.append(loss)
-				train_acc.append(acc)
-				print 'Epoch {} Iteration {} Loss {} Accuracy {}'.format(epoch, batch_id, loss, acc)
+		# for epoch in range(N_EPOCHS):
+		# 	train_loss, valid_loss = [], []
+		# 	train_acc, valid_acc = [], []
+		# 	for batch_id in range(n_batches_train):
+		# 		batch_X = X_train[BATCH_SIZE*batch_id:BATCH_SIZE*(batch_id+1)]
+		# 		batch_y = y_train[BATCH_SIZE*batch_id:BATCH_SIZE*(batch_id+1)]
+		# 		preds, loss, acc, _ = sess.run([outputs, cost, accuracy, optimizer], feed_dict={X:batch_X, y:batch_y, keep_prob:1.})
+		# 		train_loss.append(loss)
+		# 		train_acc.append(acc)
+		# 		print 'Epoch {} Iteration {} Loss {} Accuracy {}'.format(epoch, batch_id, loss, acc)
 
-			print 'Validating now...'
-			for batch_id in range(n_batches_valid):
-				batch_X = X_valid[BATCH_SIZE*batch_id:BATCH_SIZE*(batch_id+1)]
-				batch_y = y_valid[BATCH_SIZE*batch_id:BATCH_SIZE*(batch_id+1)]
-				preds, loss, acc = sess.run([outputs, cost, accuracy], feed_dict={X:batch_X, y:batch_y, keep_prob:100.})
-				valid_loss.append(loss)
-				valid_acc.append(acc)
-				print 'Epoch {} Iteration {} Validation Loss {} Validation Accuracy {}'.format(epoch, batch_id, loss, acc)
+		# 	print 'Validating now...'
+		# 	for batch_id in range(n_batches_valid):
+		# 		batch_X = X_valid[BATCH_SIZE*batch_id:BATCH_SIZE*(batch_id+1)]
+		# 		batch_y = y_valid[BATCH_SIZE*batch_id:BATCH_SIZE*(batch_id+1)]
+		# 		preds, loss, acc = sess.run([outputs, cost, accuracy], feed_dict={X:batch_X, y:batch_y, keep_prob:1.})
+		# 		valid_loss.append(loss)
+		# 		valid_acc.append(acc)
+		# 		print 'Epoch {} Iteration {} Validation Loss {} Validation Accuracy {}'.format(epoch, batch_id, loss, acc)
 
-			saver.save(sess, 'birds_epoch{}_validloss{}_validacc{}'.format(epoch, np.mean(valid_loss), np.mean(valid_acc)))
+		# 	print 'Avg Training Loss {} Accuracy {} Test Loss {} Accuracy {}'.format(np.mean(train_loss), np.mean(train_acc), np.mean(valid_loss), np.mean(valid_acc))
+		# 	saver.save(sess, './birds_epoch{}_validloss{}_validacc{}'.format(epoch, np.mean(valid_loss), np.mean(valid_acc)))
+
+# =================== Visualizing and CAM =====================================
+		saver.restore(sess, './birds_epoch38_validloss1.19091486931_validacc0.746527791023')
+		# samples = random.sample(range(X_train.shape[0]), 10) # take 10 random samples from the training_set
+		samples = range(10)
+		for idx in samples:
+			this_sample = X_train[idx].reshape((1,) + X_train[idx].shape)
+			# print this_sample.shape
+
+			# print [n.name for n in tf.get_default_graph().as_graph_def().node]
+			last_conv = tf.get_default_graph().get_tensor_by_name('conv5_3/conv5_3:0')
+			last_weights = tf.get_default_graph().get_tensor_by_name('wout/wout:0')
+			last_biases = tf.get_default_graph().get_tensor_by_name('bout:0')
+			last_conv_reshaped = tf.reshape(last_conv, [-1, 512])
+
+			print last_conv_reshaped.get_shape(), last_weights.get_shape(), last_biases.get_shape()
+			preds, feat_map, Wk_c, b_c = sess.run([outputs, last_conv_reshaped, last_weights, last_biases], feed_dict={X:this_sample, keep_prob:1.})
+			top_class = np.argmax(preds, axis=1)
+
+			class_map = tf.nn.bias_add(tf.matmul(feat_map, Wk_c[:,top_class]), b_c[top_class])
+			attention = sess.run([class_map], feed_dict={X:this_sample, keep_prob:1.})[0]
+			print attention.shape
+
+			cam = attention.reshape((14, 14))
+	        cam = cam - np.min(cam)
+	        cam_img = cam / np.max(cam)
+	        cam_img = np.uint8(255 * cam_img)
+	        cam_img = cv2.resize(cam_img, (224, 224))
+	        cam_img = cam_img.T
+	        original_img = train_img_paths[idx]
+	        original_img = cv2.imread(original_img)
+    		cv2.imwrite('original_{}.jpg'.format(idx), original_img)
+	        heatmap = cv2.applyColorMap(cam_img, cv2.COLORMAP_JET)
+    		result = heatmap * 0.3 + original_img * 0.5
+    		cv2.imwrite('CAM_{}.jpg'.format(idx), result)
